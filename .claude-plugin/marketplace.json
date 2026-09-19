@@ -1,0 +1,12 @@
+{
+  "name": "keelson-skills",
+  "owner": {
+    "name": "Keelson"
+  },
+  "plugins": [
+    {
+      "name": "keelson",
+      "source": "./plugins/keelson"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "name": "keelson",
+  "version": "0.6.7",
+  "description": "Deploy and operate web apps on Keelson with the Keelson CLI.",
+  "homepage": "https://keelson.dev",
+  "license": "MIT"
+}
