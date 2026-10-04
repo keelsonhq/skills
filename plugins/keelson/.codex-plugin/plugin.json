@@ -7,10 +7,10 @@
   "author": {
     "name": "STRICTUS LLC"
   },
-  "skills": "./plugins/keelson/skills/",
+  "skills": "./skills/",
   "interface": {
     "developerName": "STRICTUS LLC",
-    "composerIcon": "./plugins/keelson/assets/keelson-symbol-512-onblack.png",
-    "logo": "./plugins/keelson/assets/keelson-symbol-512-onblack.png"
+    "composerIcon": "./assets/keelson-symbol-512-onblack.png",
+    "logo": "./assets/keelson-symbol-512-onblack.png"
   }
 }

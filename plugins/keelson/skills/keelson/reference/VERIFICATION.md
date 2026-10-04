@@ -641,13 +641,39 @@ manually stopped app, run `keelson app start` before retrying the restart.
    its state.
 2. **Get the failures** — `keelson diagnose --app <slug> --json` bundles recent
    cron failures (cron name, `exit_code`, failure message) under
-   `cron_failures`. Crons are the only background-work surface, so this is the
-   only failure list in the bundle.
+   `cron_failures`. This is the only failure list in the bundle: background
+   task failures are not in it (see "A background task failed" below).
 3. **Read cron output** — `keelson logs cron <slug> --severity error --json` for
    the cron stderr. `--severity` is accepted on `logs app` and
    `logs cron` only.
 4. **Re-run after a fix** — `keelson crons trigger <name> --app <slug>` fires the
    cron once on demand.
+
+### A background task failed
+
+There is no CLI command that lists, inspects, shows logs for, or re-runs a
+deployed app's tasks, and `keelson diagnose` does not include them. Do not go
+looking for one.
+
+1. **Open the app's "Background Tasks" tab in the console** (app detail). It
+   lists the app's tasks with their status (`queued` / `running` /
+   `succeeded` / `failed` / `cancelled`), attempts, and failure reason;
+   **Details** shows each attempt's exit code and duration and the standard
+   error of the last attempt. Ask the user to open it, or to paste what it
+   shows, when you cannot.
+2. **Read the failure reason.** A non-zero exit or a timeout is the command's
+   own failure: read its stderr and reproduce it locally with
+   `keelson dev task run <name> --payload - --json` (payload JSON on stdin).
+   That command runs **one attempt synchronously on this machine**, against
+   the local `keelson.yaml` — it never touches the deployed app's tasks. A task
+   that ran out of the monthly Background Jobs allowance (`quota_exhausted`)
+   or was cancelled because the app was stopped or the task was removed from
+   `tasks:` is not a code bug.
+3. **Fix, redeploy, and enqueue again.** There is no manual re-run: once the
+   fix is deployed, the app has to call `enqueue` again. With the same
+   `idempotency_key` as the failed task, `enqueue` returns that finished task
+   instead of running it again, so use a new key for the retry (for example
+   append the retry number).
 
 ### Log surfaces
 

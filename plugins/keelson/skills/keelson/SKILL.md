@@ -226,18 +226,20 @@ For deeper checks (write paths, sub-resources), read
 
 ## Background Work
 
-Apps scale to zero: code runs only while handling a request or during a
-platform-initiated `cron` execution. Do post-processing that finishes
+Apps scale to zero: code runs only while handling a request, during a `cron`
+run, or during a background task attempt. Do post-processing that finishes
 within a request synchronously, before responding. Work scheduled to run *after*
 you respond is not guaranteed and must be treated as not running. This is
 unconditional — no `keelson.yaml` setting turns it into a guarantee. For
 scheduled work, declare a `crons` entry — never an in-process scheduler
-(APScheduler, node-cron, `BackgroundTasks`, `setInterval`). Event-driven
-background tasks are not currently supported.
+(APScheduler, node-cron, `BackgroundTasks`, `setInterval`). For work the user
+should not wait for, declare the command under `tasks:` and call the SDK's
+`enqueue` before responding; Keelson runs it on a separate instance and retries
+failures, so the command must be idempotent.
 Background executions run in a separate container: their durable state must live
 in the managed database (`db.mode: libsql`), the `files` SDK, or the `media`
 SDK — never on the local disk, `/data` included. See `core/KEELSON_YAML.md` →
-Background Work for the full contract.
+Background Work for the full contract and → `tasks` for the declaration.
 
 The per-app managed libSQL database is provisioned automatically. The agent
 writing the app also writes the small table/schema needed for cron history,

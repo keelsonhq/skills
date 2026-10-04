@@ -17,5 +17,6 @@ manager or `keelson install-agent`.
 - Support: support@keelson.dev
 - Privacy policy: https://keelson.dev/privacy
 
-The files in this repository are licensed under the MIT License. The Keelson CLI
-and service are distributed separately under their own terms.
+The files in this repository are licensed under the MIT License.
+The Keelson name and logo are not covered by the MIT License.
+The Keelson CLI and service are distributed separately under their own terms.

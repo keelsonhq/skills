@@ -479,8 +479,9 @@ this spec. Do not refuse to deploy an app just because it ships a `Dockerfile`.
 
 - The `command` starts a single process
 - systemd and daemon management are not available
-- For scheduled processing, use `crons` and follow the **Background Work** rules
-  below. Event-driven background tasks are not currently supported.
+- For scheduled processing, use `crons`; for work that the app triggers and that
+  does not fit in a request, use `tasks`. Follow the **Background Work** rules
+  below for both.
 
 ### Dependencies (package managers)
 
@@ -612,6 +613,72 @@ crons:
     timeout: 300
 ```
 
+#### `tasks`
+
+Background tasks: a command declared under `tasks:` runs once each time the
+app's code calls the SDK's `enqueue(name, payload)` — from a request handler,
+a cron run, or another task. Keelson starts it on a separate instance from the
+web service and retries a failed attempt automatically. Unlike a cron, a task is
+never started by the clock. Use it for work that must happen but does not fit in
+a request (see Background Work).
+
+| Field | Required | Default | Rule |
+|---|---|---|---|
+| `name` | yes | — | Slug pattern, 1–63 characters (same rule as `crons[].name`); normalized to lowercase |
+| `command` | yes | — | String (run by `/bin/sh -c`) or list (exec form) |
+| `timeout` | no | `300` | Seconds per attempt, 1–600 |
+| `max_attempts` | no | `3` | Attempts started, including the first, 1–5 |
+
+- At most **10** entries per app on every plan. Unknown keys are rejected;
+  concurrency cannot be declared.
+- Names must be unique after normalization, and a task name must not equal a
+  cron name (`task_name_conflicts_with_cron`).
+- A `keelson.yaml` with at least one task but **neither** a top-level `command`
+  **nor** `crons` is rejected (`tasks_require_command_or_crons`): nothing would
+  be able to enqueue the tasks. `type: web` with `assets` and no `command` hits
+  this too unless `crons` is declared.
+- `tasks` may be combined with `type: web` (the web service is what enqueues).
+  The `type: web` + `crons` ban still applies.
+- The `timeout` ceiling is the same **plan-bound** ceiling as `crons`: Starter
+  180 s / Plus 300 s / Team and above 600 s. A value written above the ceiling
+  is rejected at deploy (`plan_task_timeout`); an omitted `timeout` (300 s) is
+  lowered to the ceiling instead of rejected.
+- The enqueue only sees the declarations of the **currently deployed** revision;
+  an undeclared name is rejected (`TASK_NOT_DECLARED`). Removing a name from
+  `tasks:` cancels its tasks that have not started yet.
+
+Each attempt receives one JSON line on **standard input** (then stdin is
+closed); environment variables are the same as a cron run's:
+
+```json
+{"attempt_no":1,"payload":{"invoice_id":"inv_123"},"schema_version":1,"task_id":"…","task_name":"generate-pdf"}
+```
+
+`payload` is the JSON value passed to `enqueue` (`null` if omitted). `task_id`
+is the same on every attempt of a task — use it as the idempotency key inside
+the command. Exit code 0 is success; a non-zero exit, a timeout, or a lost
+completion report is a failure and is retried while attempts remain. The last
+attempt's stderr is shown in the console.
+
+```yaml
+command: "python app.py"
+db:
+  mode: libsql
+tasks:
+  - name: generate-pdf
+    command: "python generate_pdf.py"
+    timeout: 180
+    max_attempts: 5
+```
+
+Local development: with `KEELSON_MODE=local` (or no Keelson platform env), the
+SDK's `enqueue` runs the task synchronously by starting
+`keelson dev task run` as a child process — so the `keelson` CLI must be on
+`PATH`. It reads the declaration from the local `keelson.yaml`, runs **one**
+attempt, and applies only the declared `timeout`. Automatic retries, the
+concurrency limit, the pending-task limit, and the monthly allowance are not
+reproduced locally.
+
 #### `databases` (retired — never write one)
 
 `databases:` declared the on-disk SQLite files for the withdrawn file-replication
@@ -688,12 +755,14 @@ the work just never happens).
 
 ### Execution guarantee (the contract)
 
-**Code is guaranteed to run only in two windows:**
+**Code is guaranteed to run only in three windows:**
 
-1. **while a request is being handled**, and
-2. **during a platform-initiated execution** — a `cron` run.
+1. **while a request is being handled**,
+2. **during a `cron` run**, and
+3. **during a background task attempt** — a run of a `tasks` command the app
+   enqueued.
 
-Anything outside those two windows — a warm instance's idle tail after the last
+Anything outside those three windows — a warm instance's idle tail after the last
 request, a background thread you spawned, an in-process timer — is **not
 guaranteed** to run and **must be treated as not running**. Idle apps scale to
 zero, so you cannot depend on any process staying alive between a request and
@@ -706,36 +775,50 @@ in-process timer looks fine in the code and then simply never does its job
 you respond). **This is unconditional — no `keelson.yaml` setting turns it into
 a guarantee**: no persistence flag, no storage declaration, no `db.mode` value
 makes the app an always-on instance that finishes post-response work. Do not
-architect around a task completing "later". Scheduled work belongs in a `cron`;
-event-driven background tasks are not currently supported.
+architect around in-process work completing "later". Work that must happen after
+the response belongs in a background task (`tasks`), enqueued **before** the
+response is returned; work triggered by the clock belongs in a `cron`.
 
 ### First rule: finish inside the request
 
 **Post-processing that completes within the request must be done synchronously,
 inside the request handler, before the response is returned.** Do not defer it to
 a background thread / task that runs "after" the response — that work is **not
-guaranteed** to run and must be treated as not running. If the work is too slow
-to finish before responding, redesign the request or use an external task
-service; Keelson does not currently provide event-driven background tasks.
+guaranteed** to run and must be treated as not running. Work that does not
+complete within the request — the user should not wait for it, or it cannot
+start responding within 120 seconds — moves to `tasks`: declare the command,
+call the SDK's `enqueue` inside the handler, and return after `enqueue` has
+returned its `task_id`. Calling `enqueue` itself after the response puts you back
+in the unguaranteed window.
 
-### Generation rules for scheduled work
+### Generation rules for scheduled work and background tasks
 
-When an app needs scheduled work, follow all three:
+When an app needs scheduled work or background tasks, follow all four:
 
-1. **Make each cron command idempotent and bounded.** A run may be interrupted
-   or delivered more than once, so repeated execution must be safe and the
-   command must finish within its configured timeout.
+1. **Make each cron and task command idempotent and bounded.** A run may be
+   interrupted or delivered more than once, so repeated execution must be safe
+   and the command must finish within its configured timeout.
 
 2. **No in-process schedulers.** Do not embed APScheduler, `node-cron`,
    FastAPI `BackgroundTasks`, `setInterval`, `threading.Timer`, or any "run this
    later / on a loop" mechanism inside the app process. They rely on a resident
-   process that does not exist here. Declare a `crons` entry for scheduled work.
-   Event-driven background tasks are not currently supported.
+   process that does not exist here. Declare a `crons` entry for scheduled work
+   and a `tasks` entry for work the app triggers.
 
-3. **Background executions may only touch the database and the `files` /
-   `media` SDK.** A `cron` run executes in a **separate container** from the web
-   instance — it does not share the web instance's
-   disk. Its durable state must live in the managed database
+3. **Background tasks are at-least-once.** The same task can run more than
+   once: a failed attempt is retried up to `max_attempts`, and even a
+   successful attempt can run again if its completion report is lost. Write
+   the command so a repeat cannot corrupt the result — use the `task_id` from
+   stdin as the idempotency key (for example, record it in the same transaction
+   as the result and skip if it is already recorded). When enqueueing, pass a
+   stable `idempotency_key` derived from the business operation (for example
+   `invoice-<invoice_id>`) so a retried request does not create a second task.
+
+4. **Background executions must not keep durable state on local disk.** A
+   `cron` run or a task attempt executes in a **separate container** from the
+   web instance — it does not share the web instance's disk. It may call
+   external APIs, external databases, and external object storage as usual,
+   but any state it keeps on Keelson must live in the managed database
    (`db.mode: libsql`), the `files` SDK, or the `media` SDK
    (`core/DECISION.md` → Recipe: local file I/O). **Files written to any local
    path — including `/data` — during a background execution are discarded** and
@@ -1088,6 +1171,7 @@ not live until the next deploy.
 | HTTP requests | 120 seconds to start responding (first response header); exceeded → **504 Gateway Timeout** |
 | Response streaming | not cut at 120s once started; bounded by ≤ 120s idle gap between chunks and ≤ 300s total request lifetime |
 | Cron jobs | 1–600 seconds per run (`timeout` field); the ceiling is plan-bound — Starter 180 s / Plus 300 s / Team 600 s. Omitted → 300 s or the plan ceiling, whichever is shorter |
+| Background tasks | 1–600 seconds per attempt (`tasks[].timeout`); same plan-bound ceiling as cron jobs. Omitted → 300 s lowered to the plan ceiling. Up to `max_attempts` (default 3, max 5) attempts |
 | Builds | 600 seconds (10 minutes) |
 
 Notes for sync HTTP handlers:
@@ -1098,7 +1182,9 @@ Notes for sync HTTP handlers:
   deadline. The platform never auto-retries POST. Make writes that a client may
   retry **idempotent**.
 - Work that cannot start responding within 120 seconds: split it into smaller
-  client-driven chunks, or move it to `crons` (per-run cap 600s).
+  client-driven chunks, or move it to `tasks` (per-attempt cap 600s), enqueued
+  before responding. Use `crons` instead only when the work is triggered by the
+  clock.
 - Streaming (SSE etc.): send response headers early; once the stream has
   started it is bounded only by the **120s idle-gap** between chunks and the
   **300s total request** lifetime.

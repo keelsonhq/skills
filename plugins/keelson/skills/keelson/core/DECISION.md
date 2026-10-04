@@ -96,7 +96,8 @@ refuse, when the only problems are:
   (APScheduler, `node-cron`, `setInterval` + a clock check, `threading.Timer`)
   or work deferred until after the response has been sent (FastAPI
   `BackgroundTasks`, a fire-and-forget promise, a 202-then-poll flow backed by
-  an in-process task) → **background work recipe**. Unlike every other trigger
+  an in-process task) → **in-process scheduler / post-response work →
+  `crons` / `tasks` recipe**. Unlike every other trigger
   here, this one has no symptom: the deploy goes green, no error is logged, and
   the work simply never happens.
 - Ships a `Dockerfile` → not a problem at all; it is ignored. Do not refuse.
@@ -624,11 +625,12 @@ user_id = request.headers["X-Keelson-User-Id"]   # set by the platform gate
 Do not add a login page, and do not refuse to deploy an app just because it has
 no authentication of its own — Keelson provides it.
 
-### Recipe: in-process scheduler / post-response work → `crons`
+### Recipe: in-process scheduler / post-response work → `crons` / `tasks`
 
 The app assumes a process that stays alive between requests. There is none:
-code is guaranteed to run only while a request is in flight and during a
-declared `cron` run (`core/KEELSON_YAML.md` → Background Work). A scheduler or
+code is guaranteed to run only while a request is in flight, during a declared
+`cron` run, and during a background task attempt (`core/KEELSON_YAML.md` →
+Background Work). A scheduler or
 a deferred task inside the app process is not an error — it is a **silent
 no-op**, and it is the only adaptation whose omission produces a green deploy,
 no error log, and no symptom until the user notices the work never happened.
@@ -641,7 +643,8 @@ Route the work by what it is:
 | Part of the request's success condition (validate, persist, a short external call) | Do it **before the response** |
 | Output the user watches while connected (generation, progress) | **Stream the response** (SSE / chunked) |
 | An audit / history record | The **same transaction** as the business write (`db.mode: libsql`) |
-| A durable side effect the user should not wait for (email, webhook, sync) | A **claim table in the managed database, drained by a `crons` entry** — and tell the user the wait is up to one interval |
+| A durable side effect the user should not wait for (email, webhook, sync) | A **`tasks` entry**, enqueued **before the response** |
+| Heavy work that cannot start responding within 120 seconds (PDF generation, a slow external API) | A **`tasks` entry**, enqueued **before the response** |
 
 **Time-of-day schedule → a `crons` entry.** Extract the job body into its own
 entrypoint that runs to completion and exits, then delete the in-process
@@ -668,44 +671,126 @@ crons:
     timeout: 300
 ```
 
-**Post-response work → move it before the response**, and let its failure show
-in the response.
+**Work the request's success depends on → move it before the response**, and
+let its failure show in the response. This is only for work the user is
+waiting on anyway (validation, the write itself, a short external call whose
+result the response reports); a side effect the user should not wait for goes
+to a `tasks` entry, below.
 
 ```python
 # contract:skip — before/after (FastAPI)
 # BEFORE — the deferred task is not guaranteed to run; treat it as never running
-@app.post("/signup")
-async def signup(req: SignupReq, background: BackgroundTasks):
-    background.add_task(send_welcome_email, req.email)
+@app.post("/orders")
+async def create_order(req: OrderReq, background: BackgroundTasks):
+    background.add_task(reserve_stock, req.items)
     return {"ok": True}
 
-# AFTER — finish inside the request window; surface failure
-@app.post("/signup")
-async def signup(req: SignupReq):
-    await send_welcome_email(req.email)   # raise → the client sees the error
+# AFTER — the order is not placed unless stock is reserved; surface failure
+@app.post("/orders")
+async def create_order(req: OrderReq):
+    await reserve_stock(req.items)   # raise → the client sees the error
     return {"ok": True}
 ```
 
-**A side effect that must survive the response → a claim table plus a `crons`
-drain.** There is no platform queue and no way for the app to trigger an
-execution: event-driven background tasks are not currently supported. What the
-app *can* do is write the work down and let a scheduled run pick it up. The
-request handler inserts a row; a `crons` entrypoint selects the unclaimed rows,
-does the work, and marks them done. Both halves live in the managed database
-(`db.mode: libsql`) — the web instance and the cron run share no disk.
+**A side effect that must survive the response, or heavy work → a `tasks`
+entry.** Move the work into its own command that reads one JSON line from
+stdin, does the work, and exits; declare it under `tasks:`
+(`core/KEELSON_YAML.md` → `tasks`); and have the request handler call the SDK's
+`enqueue` **before it returns the response**. Keelson runs the command on a
+separate instance and retries a failed attempt. `enqueue` must return its
+`task_id` before the response goes out — an `enqueue` deferred until after the
+response is back in the window where nothing is guaranteed to run.
 
-Three rules make this safe, and none of them is optional:
+Install the latest SDK for the stack and import it: Python
+`from keelson import tasks`, Node `import { enqueue } from "@keelsonhq/tasks"`,
+Go `github.com/keelsonhq/go-sdk/tasks`. Locally (`KEELSON_MODE=local`) the SDK
+runs the task synchronously through `keelson dev task run`, so the `keelson`
+CLI must be on `PATH`.
+
+Idempotency comes in two layers, and both are required:
+
+- **Pass a stable `idempotency_key` to `enqueue`**, derived from the business
+  operation (`invoice-<invoice_id>`), not a random value. A retried request, or
+  an `enqueue` whose result was lost and is called again, then returns the
+  existing task instead of creating a second one. (Node `idempotencyKey`, Go
+  `tasks.WithIdempotencyKey(...)`.)
+- **Make the command idempotent on `task_id`.** The same task can run more than
+  once (at-least-once): record the `task_id` from stdin in the same transaction
+  as the result, and skip the work when it is already recorded.
+
+```python
+# contract:skip — before/after (FastAPI → send_invoice.py)
+# BEFORE — the deferred task is not guaranteed to run; treat it as never running
+@app.post("/invoices/{invoice_id}/send")
+async def send(invoice_id: str, background: BackgroundTasks):
+    background.add_task(render_and_email_invoice, invoice_id)
+    return {"ok": True}
+
+# AFTER — app.py: enqueue before the response, keyed on the business operation
+from keelson import tasks
+
+@app.post("/invoices/{invoice_id}/send")
+async def send(invoice_id: str):
+    task_id = tasks.enqueue("send-invoice", {"invoice_id": invoice_id},
+                            idempotency_key=f"invoice-{invoice_id}")
+    db.execute("UPDATE invoices SET send_status = 'queued', task_id = ? WHERE id = ?",
+               (task_id, invoice_id))
+    return {"ok": True}
+
+# AFTER — send_invoice.py: one attempt; a repeat of the same task_id is a no-op
+import json, sys
+
+job = json.loads(sys.stdin.readline())
+with db.transaction() as tx:
+    if tx.execute("SELECT 1 FROM sent_invoices WHERE task_id = ?",
+                  (job["task_id"],)).fetchone():
+        sys.exit(0)
+    render_and_email_invoice(job["payload"]["invoice_id"])
+    tx.execute("INSERT INTO sent_invoices (task_id, invoice_id) VALUES (?, ?)",
+               (job["task_id"], job["payload"]["invoice_id"]))
+    tx.execute("UPDATE invoices SET send_status = 'sent' WHERE id = ?",
+               (job["payload"]["invoice_id"],))
+```
+
+```yaml
+# contract:skip — fragment
+tasks:
+  - name: send-invoice
+    command: "python send_invoice.py"
+    timeout: 180
+    max_attempts: 5
+```
+
+Show progress from the app's own database: keep a status column the command
+updates, as above, and read it in the UI. The SDK's `get(task_id)` (status,
+attempts started, last failure code) is a supplement, not the place to keep
+state the user sees. A **202-then-poll flow** backed by an in-process task is
+rewritten to this same shape — the poll endpoint reads the status column.
+
+**Alternative: a claim table plus a `crons` drain.** Keep the work in a table
+and let a scheduled run pick it up only when that is what the app wants: the
+work should be processed in batches at a set time of day, or many small items
+batched into one run are estimated to use fewer executions of the monthly
+Background Jobs allowance than one task attempt per item. The request handler
+inserts a row; a `crons` entrypoint selects the unclaimed rows, does the work,
+and marks them done. Both halves live in the managed database
+(`db.mode: libsql`) — the web instance and the cron run share no disk. Do not
+choose it to save the allowance without doing that estimate: every cron run
+that starts counts against the same allowance as a task attempt, **including a
+run that finds no rows**.
+
+Three rules make the drain safe, and none of them is optional:
 
 - **The drain body must be idempotent.** A run can be killed at `timeout` after
   the side effect but before the row is marked done, and the next run will see
   that row again.
-- **Count attempts and give up.** There is no platform retry and no dead-letter
+- **Count attempts and give up.** A cron has no retry and no dead-letter
   queue: a row that fails forever is drained forever. Cap the attempts, record
   the failure, and make it visible in the app.
 - **State the delay to the user before you build it.** The row waits until the
   next run. The minimum interval is plan-bound (60 minutes on the lowest plan),
   so "we'll email you right away" is not a promise this shape can keep. If the
-  UX needs it to be immediate, do it before the response instead.
+  UX needs it to be prompt, use a `tasks` entry instead.
 
 **Output the user watches while connected → stream the response.** SSE /
 chunked streaming keeps the work inside the request window. Two limits, and
@@ -723,11 +808,15 @@ interval and cron count come from the user's plan):
 - A run still executing at `timeout` is killed (`timeout` 1–600s; the plan
   ceiling is Starter 180 s / Plus 300 s / Team 600 s, and an omitted value is
   300 s or the ceiling, whichever is shorter).
-- When the workspace's monthly Scheduled Jobs allowance is exhausted, the
-  month's remaining runs are **skipped, not queued** — and skipped runs still
-  count. A frequent drain spends that allowance on every tick whether or not
-  there is work, so add up the ticks of every cron in the app before choosing an
-  interval.
+- The workspace's monthly Background Jobs allowance counts cron runs and
+  background task attempts together, across every app in the workspace. Every
+  cron run that actually starts counts, even one that finds no work; a run
+  that never starts (skipped because the allowance is exhausted, or because the
+  previous run is still going) does not. When the allowance is exhausted, the
+  month's remaining cron runs are **skipped, not queued**. A frequent drain
+  spends that allowance on every tick whether or not there is work, so add up
+  the ticks of every cron in the app, and the task attempts it will start,
+  before choosing an interval.
 - The schedule is evaluated in the workspace's timezone, fixed when the
   workspace was created (set from the owner's browser; server fallback UTC).
   Confirm the effective value with `keelson crons list --json` rather than
@@ -740,6 +829,40 @@ interval and cron count come from the user's plan):
 - Interval and cron count are plan-bound. If the design needs a tighter interval
   than the user's plan allows, say so before deploying instead of declaring a
   schedule that will be rejected.
+
+**Execution contract for `tasks`** (the declaration rules live in
+`core/KEELSON_YAML.md` → `tasks`):
+
+- **At-least-once.** A failed attempt (non-zero exit, timeout, lost completion
+  report) is retried while attempts remain, and even a successful attempt can
+  run again if its completion report is lost. `attempt_no` on stdin tells the
+  command which attempt it is.
+- `max_attempts` counts attempts started, including the first: default 3,
+  maximum 5. Each attempt is killed at its `timeout` (same plan-bound ceiling
+  as a cron run).
+- Attempts of one app run at most **1 at a time on Starter / Plus and 2 on
+  Team and above**; the rest wait for a free slot, with no upper bound on the
+  wait.
+- At most **1,000** tasks per app may be waiting to run (`queued`, which
+  includes waiting for a retry). Beyond that, `enqueue` is rejected
+  (`TASK_BACKLOG_LIMIT_EXCEEDED`).
+- The `enqueue` request body — the serialized `payload` and `idempotency_key`
+  together — may be at most **64 KiB (65,536 bytes)**
+  (`TASK_PAYLOAD_TOO_LARGE`). Pass an ID and read the data in the command
+  rather than sending the data itself. The payload is deleted 7 days after the
+  task finishes.
+- Every attempt started counts as one execution of the monthly Background
+  Jobs allowance, retries included. When the allowance is exhausted, `enqueue`
+  is rejected (`TASK_MONTHLY_QUOTA_EXCEEDED`), and a task that needed a retry
+  ends as failed (`quota_exhausted`).
+- There is **no manual re-run** and no delayed start. To redo a failed task,
+  the app enqueues it again.
+- When the app is suspended, quarantined, or deleted, or a deploy removes the
+  task from `tasks:`, `enqueue` is closed and tasks that have not started are
+  cancelled. An attempt already running is left to finish, but is not retried
+  if it fails.
+- An attempt runs in a **separate container**, exactly like a cron run: no
+  shared disk with the web instance, and files written locally are discarded.
 
 **What does NOT need this recipe** (do not over-rewrite):
 
@@ -759,7 +882,10 @@ shapes are not: a **202-then-poll flow**, because the response contract and the
 client's polling loop both change, and any work whose **timing the user can
 observe**, because "sent immediately" becoming "sent within the hour" is a
 product change, not a refactor. Those are `ask` — state the new worst case and
-get approval before rewriting.
+get approval before rewriting. Moving post-response work into a `tasks` entry
+is `ask` for the same reason: the work moves to a separate instance with
+retries, so it has to be made idempotent, it spends the monthly Background Jobs
+allowance, and when it finishes becomes visible to the user.
 
 ---
 
@@ -1206,7 +1332,7 @@ Before running `keelson deploy`, verify the following in order:
    source for `new CronJob(`, `BackgroundTasks`, `threading.Timer`, and
    server-side `setInterval`; and read the request handlers for work that runs
    after the response is returned. Every hit must end up either rewritten under
-   **Recipe: in-process scheduler / post-response work → `crons`** or
+   **Recipe: in-process scheduler / post-response work → `crons` / `tasks`** or
    classified as safe — frontend timers, work already awaited before the
    response, a cache that may vanish at scale-to-zero, or a producer whose
    consumer really runs elsewhere and is reachable. Nothing else on this list

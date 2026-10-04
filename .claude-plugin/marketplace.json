@@ -1,5 +1,6 @@
 {
   "name": "keelson-skills",
+  "description": "Deploy and operate web apps on Keelson with the Keelson CLI.",
   "owner": {
     "name": "Keelson"
   },
