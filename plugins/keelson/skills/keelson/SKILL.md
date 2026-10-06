@@ -69,6 +69,11 @@ HTTP method. On delivery paths that pass through the gateway, GET requests to
 reach the app. The whole `/api/webhooks/` and `/api/external/` subtrees are
 non-interactive (credential-authenticated, never a browser session), and the
 edge blocks all methods to `/api/webhooks/email` and `/api/webhooks/email-events`.
+On delivery paths that pass through the gateway, `/api/mcp` and everything
+below it are reserved for MCP tool calls whether or not the app declares
+`mcp:` — any other request there gets 404 — and an app deployed with
+`mcp.enabled: true` also loses `/mcp` and
+`/.well-known/oauth-protected-resource` (plus `/mcp` appended) to the edge.
 `/assets`, `/files`, `/static`, `/uploads`, the rest of `/api`, `/docs`, and
 `/media` remain app-owned. A Node build that emits a top-level `__keelson`
 directory is rejected with `reserved_path_conflict`. See
@@ -257,6 +262,17 @@ file lists the four error shapes an agent must recognise —
 `stream not found`, `TRANSACTION_TIMEOUT`, `SQLITE_BUSY`, and constraint
 violations arriving as bare `ValueError` rather than `IntegrityError` — with the
 recovery for each.
+
+## MCP (AI Clients)
+
+A container app can let AI clients (Claude, ChatGPT) call it as an MCP server:
+declare the tools under `mcp:` in `keelson.yaml` (or in a separate file named
+by `mcp.file`) and implement one JSON handler per tool at
+`POST /api/mcp/<name>`; Keelson runs the MCP server, the login and the consent
+screen, and forwards the caller as `X-Keelson-User-Id`. Add it only when the
+user explicitly asks to use the app from an AI client, and propose the tools
+before deploying them. See `core/KEELSON_YAML.md` → `mcp` for the declaration
+and the handler contract.
 
 ## Files
 

@@ -387,8 +387,19 @@ Some URL paths are handled by the platform before a request can reach your app:
   machine credential check before interactive login is ever tried; a logged-in
   browser user gets 401 there. Put only externally-called endpoints under these
   prefixes (see `auth.endpoints`), never a normal app route.
-- **`/assets`, `/files`, `/static`, `/uploads`, the rest of `/api`, `/docs`, and
-  `/media` are app-owned paths.** Requests to these paths reach the app
+- **`/api/mcp` and every path below it are reserved for MCP tool calls on
+  delivery paths that pass through the gateway** (container apps and the
+  origin side of hybrid apps), whether or not the app declares `mcp:`. A request
+  that does not come through MCP gets 404, so a normal app route there is
+  unreachable; only the `POST /api/mcp/<name>` handlers of declared tools are
+  ever called (see `mcp`). Static files served directly by the edge (static,
+  SPA, and the static part of hybrid apps) are not affected.
+- **When `mcp.enabled: true` is deployed, the edge owns `/mcp` (exact path),
+  `/.well-known/oauth-protected-resource` and
+  `/.well-known/oauth-protected-resource/mcp`** on the app's host; these never
+  reach the app.
+- **`/assets`, `/files`, `/static`, `/uploads`, the rest of `/api` (except
+  `/api/mcp`), `/docs`, and `/media` are app-owned paths.** Requests to these paths reach the app
   normally. A Vite app that references `/assets/index-*.js` needs no
   configuration change.
 - **A build must not emit a top-level `__keelson` directory into its served
@@ -678,6 +689,164 @@ SDK's `enqueue` runs the task synchronously by starting
 attempt, and applies only the declared `timeout`. Automatic retries, the
 concurrency limit, the pending-task limit, and the monthly allowance are not
 reproduced locally.
+
+#### `mcp`
+
+MCP tools: `mcp:` lets AI clients (Claude, ChatGPT) use the app as an MCP
+server. Keelson runs the MCP server, the OAuth login and the consent screen;
+the app only implements one JSON handler per tool at `POST /api/mcp/<name>`.
+Use it only when the user explicitly asks for it ("use this app from Claude /
+ChatGPT"); never add `mcp:` on your own. Adding, removing or changing a tool
+changes what users can do from their AI clients, so propose the declaration and
+wait for approval (`ask`, as for any user-visible behaviour change).
+
+Only **container apps** (a `command` and no `assets`) can declare it; a static,
+SPA or hybrid app is rejected (`mcp is only supported for container apps`).
+
+`mcp`:
+
+| Field | Required | Default | Rule |
+|---|---|---|---|
+| `enabled` | yes | — | `true` publishes the tools; `false` keeps the declaration but stops the calls |
+| `instructions` | no | none | Text for the AI client describing the tools; at most 4096 characters |
+| `tools` | when `enabled: true` | — | 1–40 entries whenever written (even with `enabled: false`); names must be unique |
+| `file` | no | — | Moves `instructions` / `tools` into a separate YAML file (see below). Read by the CLI only |
+
+`mcp.tools[]`:
+
+| Field | Required | Default | Rule |
+|---|---|---|---|
+| `name` | yes | — | `^[a-z][a-z0-9_]{0,63}$` (not normalized); the handler path is `POST /api/mcp/<name>` |
+| `description` | yes | — | Shown to the AI client; 1–1024 characters, not only whitespace |
+| `access` | yes | — | `read` or `write`. Users consent to `write` tools separately and may approve read-only |
+| `permission` | no | `view` | `view` or `manage`. A `manage` tool is usable only by people with the app's MANAGE permission |
+| `input` | yes | — | JSON Schema 2020-12 for the arguments; top level `type: object` |
+
+- `input` must be plain JSON: at most 32 levels deep and 64 KB as compact JSON.
+  Do not use `$ref`, `$dynamicRef`, `$recursiveRef` or `x-mcp-header` (`$ref`
+  and `x-mcp-header` are rejected at deploy; the other two fail every call).
+  Quote dates and any key that could read as a non-string (`"yes"`, `"on"`).
+- Unknown keys are rejected under `mcp` and `mcp.tools[]`; `endpoint` is
+  rejected because the handler path is fixed. YAML anchors, aliases and merge
+  keys (`<<`) are not allowed anywhere under `mcp`.
+- A user sees only the tools they may call: tools needing a permission they
+  lack, or `write` tools they did not consent to, are left out of the list.
+
+```yaml
+command: "python app.py"
+db:
+  mode: libsql
+mcp:
+  enabled: true
+  instructions: "Look up stock levels and record incoming deliveries."
+  tools:
+    - name: search_items
+      description: "Search stock by item name."
+      access: read
+      input:
+        type: object
+        properties:
+          query:
+            type: string
+        required: [query]
+    - name: create_arrival
+      description: "Record one incoming delivery."
+      access: write
+      permission: manage
+      input:
+        type: object
+        properties:
+          item_id:
+            type: string
+          quantity:
+            type: integer
+            minimum: 1
+        required: [item_id, quantity]
+```
+
+**`mcp.file` — prefer it.** Put `instructions` and `tools` in a separate file
+next to `keelson.yaml` and keep only `enabled` and `file` in `keelson.yaml`.
+The CLI inlines the file before validating and uploads the expanded
+`keelson.yaml`; your local file is not rewritten. Writing the tools directly
+under `mcp:` is fine when there is only one tool.
+
+```yaml
+# contract:skip — keelson.yaml half of the mcp.file pair (checked by TestSkillDocMCPFileExampleIsValid)
+slug: stock-desk
+runtime: python-slim
+command: "python app.py"
+db:
+  mode: libsql
+mcp:
+  enabled: true
+  file: mcp.yaml
+```
+
+```yaml
+# contract:skip — mcp.yaml half of the mcp.file pair (checked by TestSkillDocMCPFileExampleIsValid)
+instructions: "Look up stock levels and record incoming deliveries."
+tools:
+  - name: search_items
+    description: "Search stock by item name."
+    access: read
+    input:
+      type: object
+      properties:
+        query:
+          type: string
+      required: [query]
+  - name: create_arrival
+    description: "Record one incoming delivery."
+    access: write
+    permission: manage
+    input:
+      type: object
+      properties:
+        item_id:
+          type: string
+        quantity:
+          type: integer
+          minimum: 1
+      required: [item_id, quantity]
+```
+
+- The file may contain only `instructions` and `tools` (each at most once) as a
+  single YAML mapping. `enabled` stays in `keelson.yaml`, and `mcp.file` cannot
+  be combined with `mcp.instructions` / `mcp.tools`.
+- Path: relative to the directory holding `keelson.yaml`, staying inside it
+  after resolving symlinks and `..`; must end in `.yaml` or `.yml`; a regular
+  file of at most 4 MiB.
+- Errors under the inlined fields name the file (`mcp.yaml: tools[1].input ...`).
+- Older CLIs reject `file` as an unsupported `mcp` key. If that happens, the
+  user's CLI is older than this skill: tell them to run `keelson upgrade`. Paths
+  that do not go through the CLI never expand `mcp.file`.
+
+The handler contract (what `POST /api/mcp/<name>` receives and must return):
+
+- **Body**: the tool arguments as a JSON object (`{}` when there are none),
+  already validated against `input` by the gateway.
+- **Headers**: only the gateway's allow-list reaches the app — the AI client's
+  token and any client-supplied `X-Keelson-*` header never do. Identify the
+  caller with `X-Keelson-User-Id` (also `X-Keelson-User-Email`,
+  `X-Keelson-User-Name`) and check `X-Keelson-User-App-Perms` (`view` or
+  `view,manage`) as in Access Control. `X-Keelson-Auth-Source: mcp` marks an
+  MCP call, `X-Keelson-Mcp-Tool` carries the tool name, and
+  `X-Keelson-Mcp-Client` the AI client's `client_id` URL.
+- **Response**: return 2xx with a JSON body of at most 1 MiB. An empty, 204,
+  non-JSON or larger 2xx body is reported to the client as an invalid tool
+  response. For a 4xx, the first 4 KiB of the body is shown to the user and the
+  AI client — put only text the user may see there. A 3xx or 5xx body is never
+  shown. No response is retried.
+- **Time**: each call has 60 seconds in total; a slower call is reported as
+  "outcome unknown". Move longer work to `tasks` and return right away.
+- **Limits**: 60 calls per minute per connection and 10 concurrent calls per
+  app, on every plan.
+
+Declaring `mcp` with `enabled: true` reserves `/mcp` and the OAuth Protected
+Resource Metadata paths on the app's host, and `/api/mcp/*` is never reachable
+except through MCP — see Reserved URL Paths. Users connect an AI client to
+`https://<app host>/mcp` (shown in the console's MCP tab for the app); only
+clients identifying as `claude.ai` or `chatgpt.com` are accepted.
 
 #### `databases` (retired — never write one)
 
@@ -1172,6 +1341,7 @@ not live until the next deploy.
 | Response streaming | not cut at 120s once started; bounded by ≤ 120s idle gap between chunks and ≤ 300s total request lifetime |
 | Cron jobs | 1–600 seconds per run (`timeout` field); the ceiling is plan-bound — Starter 180 s / Plus 300 s / Team 600 s. Omitted → 300 s or the plan ceiling, whichever is shorter |
 | Background tasks | 1–600 seconds per attempt (`tasks[].timeout`); same plan-bound ceiling as cron jobs. Omitted → 300 s lowered to the plan ceiling. Up to `max_attempts` (default 3, max 5) attempts |
+| MCP tool calls | 60 seconds per call to `POST /api/mcp/<name>` (connect, headers and body together); not retried (see `mcp`) |
 | Builds | 600 seconds (10 minutes) |
 
 Notes for sync HTTP handlers:

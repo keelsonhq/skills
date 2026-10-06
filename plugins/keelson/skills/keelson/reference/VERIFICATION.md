@@ -675,6 +675,37 @@ looking for one.
    instead of running it again, so use a new key for the retry (for example
    append the retry number).
 
+### An AI client cannot connect over MCP
+
+The connection, login and consent run between the AI client and Keelson, not
+in the app; there is no CLI command that lists MCP connections. The connection
+URL is `https://<app host>/mcp`, shown in the console's MCP tab for the app.
+Check in this order:
+
+1. **The declaration is live.** The app is a container app, the deployed
+   `keelson.yaml` has `mcp.enabled: true` and the deploy finished. With
+   `mcp.enabled: false` (or no `mcp:`) the edge does not serve `/mcp`.
+2. **The client is accepted.** Only clients identifying as `claude.ai` or
+   `chatgpt.com` are accepted; any other client stops at the login step. That
+   is a platform rule, not an app bug. For where to register the URL, point the
+   user to their AI client's own MCP settings documentation.
+3. **A tool is missing from the list.** The user lacks the permission the tool
+   needs (`permission: manage` needs the app's MANAGE permission), approved
+   read-only so `write` tools are hidden (reconnect and approve them), or a
+   workspace Owner / Admin has stopped MCP under Settings > Security.
+4. **Calls are refused by IP restriction.** The workspace's IP restriction
+   applies to MCP calls too, and calls from claude.ai or ChatGPT come from
+   those vendors' servers, not from the user's machine.
+5. **A call fails with "invalid tool response".** The handler at
+   `POST /api/mcp/<name>` must return 2xx with a JSON body of at most 1 MiB;
+   an empty, 204 or non-JSON body is rejected. A 5xx or 3xx body is never
+   shown, so read the app log: `keelson logs app <slug> --severity error --json`.
+   A call over 60 seconds is reported as "outcome unknown".
+6. **A route under `/api/mcp/` returns 404 from a browser or curl.** That
+   prefix only answers MCP calls; move non-MCP routes elsewhere.
+7. **`keelson deploy` rejects `mcp.file` as an unsupported key.** The CLI is
+   older than this skill; run `keelson upgrade`.
+
 ### Log surfaces
 
 | Command | Source |
