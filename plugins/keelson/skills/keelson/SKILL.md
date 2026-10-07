@@ -198,6 +198,29 @@ keys) through the Directory/identity API. Manage groups with `keelson groups ...
 and app bindings with `keelson access ...`; there is no `groups:`/`access:` block
 in `keelson.yaml`.
 
+## Local Development
+
+To run the app on the developer's machine, start it with
+`keelson dev serve -- <command that starts the app's own server>` (for example
+`keelson dev serve -- uvicorn main:app --host 127.0.0.1 --port {port}`). Pass
+the real server command, not a launcher script that itself calls
+`keelson dev serve`. The CLI hands the app a free port in `PORT` (and replaces
+`{port}` in the command), serves it at `http://localhost:5173/` (`--port` to
+change), and adds the same `X-Keelson-User-*` headers as the gateway; the
+Identity SDK's member and group calls answer from the local user list
+(`--users <file>`, else `./.keelson/dev-users.json`, else four built-in users).
+If `keelson dev serve --check` exits non-zero (CLI missing or too old), start
+the server directly with `KEELSON_LOCAL_MODE=1` instead; the Identity SDK then
+returns one fixed user and users cannot be switched. If the app uses its own
+user list with `--users <file>`, also pass `KEELSON_LOCAL_USERS_FILE=<same file>`
+on the direct start so user IDs stay the same with or without the CLI.
+
+To check behavior as another user, send `X-Keelson-Dev-As: <user id>` on the
+request (for example `curl -H "X-Keelson-Dev-As: local-user-003" http://localhost:5173/`),
+or have the user open `http://localhost:5173/__keelson/dev` in a browser.
+Never set `KEELSON_LOCAL_MODE` in `keelson.yaml` or secrets — the SDK raises an
+error in a deployed app.
+
 ## Deploy And Operate
 
 When you write `keelson.yaml` for a **new** app, include a top-level
