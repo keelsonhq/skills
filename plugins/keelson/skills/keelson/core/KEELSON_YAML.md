@@ -1034,7 +1034,10 @@ Routing guidance (normative):
   for those. This is also the only route for a stack with no libSQL client
   (e.g. Django): point it at an external database and supply the credentials
   through `secrets`. Outbound SMTP on ports 25, 465, 587, and 2525 is blocked;
-  send mail through a mail provider's HTTPS API.
+  send mail through Keelson's Email SDK or a mail provider's HTTPS API. With the
+  Email SDK the sender is always `<app slug>@mail.keelson.run`, and mail may go
+  only to the app's own users for transactional notices (no marketing blasts,
+  no purchased or non-user lists).
 
 **Prohibited:** Do not mutate a running app's SQLite database, WAL, or journal
 files out of band through local file writes. Change data through the app itself

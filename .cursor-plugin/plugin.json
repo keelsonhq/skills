@@ -1,6 +1,6 @@
 {
   "name": "keelson",
-  "version": "0.6.11",
+  "version": "0.6.12",
   "description": "Deploy and operate web apps on Keelson with the Keelson CLI.",
   "homepage": "https://keelson.dev",
   "license": "MIT",
